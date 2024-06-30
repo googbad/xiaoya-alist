@@ -3,6 +3,22 @@
 # shellcheck disable=SC2086
 PATH=${PATH}:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin:/opt/homebrew/bin
 export PATH
+#
+# ——————————————————————————————————————————————————————————————————————————————————
+# __   ___                                    _ _     _
+# \ \ / (_)                             /\   | (_)   | |
+#  \ V / _  __ _  ___  _   _  __ _     /  \  | |_ ___| |_
+#   > < | |/ _` |/ _ \| | | |/ _` |   / /\ \ | | / __| __|
+#  / . \| | (_| | (_) | |_| | (_| |  / ____ \| | \__ \ |_
+# /_/ \_\_|\__,_|\___/ \__, |\__,_| /_/    \_\_|_|___/\__|
+#                       __/ |
+#                      |___/
+#
+# Copyright (c) 2024 DDSRem <https://blog.ddsrem.com>
+#
+# This is free software, licensed under the Mit License.
+#
+# ——————————————————————————————————————————————————————————————————————————————————
 
 Green="\033[32m"
 Red="\033[31m"
@@ -24,38 +40,72 @@ function WARN() {
 
 function container_update() {
 
-    if ! docker inspect containrrr/watchtower:latest > /dev/null 2>&1; then
-        if docker pull containrrr/watchtower:latest; then
-            INFO "镜像拉取成功！"
-            REMOVE_WATCHTOWER_IMAGE=true
+    local run_image remove_image IMAGE_MIRROR pull_image
+    if docker inspect assaflavie/runlike:latest > /dev/null 2>&1; then
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' assaflavie/runlike:latest | cut -f2 -d:)
+        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/assaflavie/runlike/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        if [ "$local_sha" != "$remote_sha" ]; then
+            docker rmi assaflavie/runlike:latest
+            docker_pull "assaflavie/runlike:latest"
+        fi
+    else
+        docker_pull "assaflavie/runlike:latest"
+    fi
+    INFO "获取 ${1} 容器信息中..."
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v /tmp:/tmp assaflavie/runlike "${@}" > "/tmp/container_update_${*}"
+    run_image=$(docker container inspect -f '{{.Config.Image}}' "${@}")
+    remove_image=$(docker images -q ${run_image})
+    local retries=0
+    local max_retries=3
+    IMAGE_MIRROR=$(cat "${DDSREM_CONFIG_DIR}/image_mirror.txt")
+    while [ $retries -lt $max_retries ]; do
+        if docker pull "${IMAGE_MIRROR}/${run_image}"; then
+            INFO "${1} 镜像拉取成功！"
+            break
         else
-            ERROR "镜像拉取失败！"
-            exit 1
+            WARN "${1} 镜像拉取失败，正在进行第 $((retries + 1)) 次重试..."
+            retries=$((retries + 1))
+        fi
+    done
+    if [ $retries -eq $max_retries ]; then
+        ERROR "镜像拉取失败，已达到最大重试次数！"
+        return 1
+    else
+        if [ "${IMAGE_MIRROR}" != "docker.io" ]; then
+            pull_image=$(docker images -q "${IMAGE_MIRROR}/${run_image}")
+        else
+            pull_image=$(docker images -q "${run_image}")
+        fi
+        if ! docker stop "${@}" > /dev/null 2>&1; then
+            if ! docker kill "${@}" > /dev/null 2>&1; then
+                docker rmi "${IMAGE_MIRROR}/${run_image}"
+                ERROR "更新失败，停止 ${*} 容器失败！"
+                return 1
+            fi
+        fi
+        INFO "停止 ${*} 容器成功！"
+        if ! docker rm --force "${@}" > /dev/null 2>&1; then
+            ERROR "更新失败，删除 ${*} 容器失败！"
+            return 1
+        fi
+        INFO "删除 ${*} 容器成功！"
+        if [ "${pull_image}" != "${remove_image}" ]; then
+            INFO "删除 ${remove_image} 镜像中..."
+            docker rmi "${remove_image}" > /dev/null 2>&1
+        fi
+        if [ "${IMAGE_MIRROR}" != "docker.io" ]; then
+            docker tag "${IMAGE_MIRROR}/${1}" "${1}" > /dev/null 2>&1
+            docker rmi "${IMAGE_MIRROR}/${1}" > /dev/null 2>&1
+        fi
+        if bash "/tmp/container_update_${*}"; then
+            rm -f "/tmp/container_update_${*}"
+            INFO "${*} 更新成功"
+            return 0
+        else
+            ERROR "更新失败，创建 ${*} 容器失败！"
+            return 1
         fi
     fi
-
-    CURRENT_WATCHTOWER=$(docker ps --format '{{.Names}}' --filter ancestor=containrrr/watchtower | sed ':a;N;$!ba;s/\n/ /g')
-
-    if [ -n "${CURRENT_WATCHTOWER}" ]; then
-        docker stop "${CURRENT_WATCHTOWER}"
-    fi
-
-    docker run --rm \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        containrrr/watchtower:latest \
-        --run-once \
-        --cleanup \
-        "${@}"
-
-    if [ "${REMOVE_WATCHTOWER_IMAGE}" == "true" ]; then
-        docker rmi containrrr/watchtower:latest
-    fi
-
-    if [ -n "${CURRENT_WATCHTOWER}" ]; then
-        docker start "${CURRENT_WATCHTOWER}"
-    fi
-
-    INFO "${*} 更新成功"
 
 }
 
@@ -109,7 +159,7 @@ function pull_run_glue() {
 
 function pull_run_glue_xh() {
 
-    BUILDER_NAME="xiaoya_builder_$(date -u +"T%H%M%S%3NZ")"
+    BUILDER_NAME="xiaoya_builder_$(date +%S%N | cut -c 7-11)"
 
     if docker inspect xiaoyaliu/glue:latest > /dev/null 2>&1; then
         local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest | cut -f2 -d:)
@@ -221,6 +271,28 @@ function test_xiaoya_status() {
 
 }
 
+function wait_emby_start() {
+
+    start_time=$(date +%s)
+    CONTAINER_NAME=${EMBY_NAME}
+    TARGET_LOG_LINE_SUCCESS="All entry points have started"
+    while true; do
+        line=$(docker logs "$CONTAINER_NAME" 2>&1 | tail -n 10)
+        echo "$line"
+        if [[ "$line" == *"$TARGET_LOG_LINE_SUCCESS"* ]]; then
+            break
+        fi
+        current_time=$(date +%s)
+        elapsed_time=$((current_time - start_time))
+        if [ "$elapsed_time" -gt 600 ]; then
+            WARN "Emby 未正常启动超时 10 分钟，终止脚本！"
+            return 1
+        fi
+        sleep 3
+    done
+
+}
+
 function update_media() {
 
     INFO "开始更新 ${1}"
@@ -250,6 +322,11 @@ function update_media() {
         pull_run_glue aria2c -o "${1}" --allow-overwrite=true --auto-file-renaming=false --enable-color=false -c -x6 "${xiaoya_addr}/d/元数据/${1}"
     fi
 
+    if [ -f "${MEDIA_DIR}/temp/${1}.aria2" ]; then
+        ERROR "存在 ${MEDIA_DIR}/temp/${1}.aria2 文件，下载不完整！"
+        return 1
+    fi
+
     INFO "设置目录权限..."
     chmod 777 "${MEDIA_DIR}"/temp/"${1}"
     chown 0:0 "${MEDIA_DIR}"/temp/"${1}"
@@ -257,6 +334,7 @@ function update_media() {
     INFO "${1} 下载完成！"
 
     if docker container inspect "${RESILIO_NAME}" > /dev/null 2>&1; then
+        INFO "Resilio 关闭中..."
         docker stop ${RESILIO_NAME}
     fi
 
@@ -270,7 +348,7 @@ function update_media() {
         all_size=$(du -k ${MEDIA_DIR}/temp/all.mp4 | cut -f1)
         if [[ "$all_size" -le 30000000 ]]; then
             ERROR "all.mp4 下载不完整，文件大小(in KB):$all_size 小于预期"
-            exit 1
+            return 1
         else
             INFO "all.mp4 文件大小验证正常"
             pull_run_glue 7z x -aoa -mmt=16 /media/temp/all.mp4
@@ -286,7 +364,7 @@ function update_media() {
         pikpak_size=$(du -k ${MEDIA_DIR}/temp/pikpak.mp4 | cut -f1)
         if [[ "$pikpak_size" -le 14000000 ]]; then
             ERROR "pikpak.mp4 下载不完整，文件大小(in KB):$pikpak_size 小于预期"
-            exit 1
+            return 1
         else
             INFO "pikpak.mp4 文件大小验证正常"
             pull_run_glue 7z x -aoa -mmt=16 /media/temp/pikpak.mp4
@@ -301,6 +379,205 @@ function update_media() {
     fi
 
     INFO "${1} 更新完成"
+
+}
+
+function sync_emby_config() {
+
+    MEDIA_DIR=$1
+    if [ "$2" ]; then
+        EMBY_URL=$(cat $2/emby_server.txt)
+        CONFIG_DIR=$2
+    else
+        EMBY_URL=$(cat /etc/xiaoya/emby_server.txt)
+        CONFIG_DIR=/etc/xiaoya
+    fi
+    if [ "$3" ]; then
+        EMBY_NAME=$3
+    else
+        EMBY_NAME=emby
+    fi
+    if [ "$4" ]; then
+        RESILIO_NAME=$4
+    else
+        RESILIO_NAME=resilio
+    fi
+    if [ "$5" ]; then
+        EMBY_APIKEY=$5
+    else
+        EMBY_APIKEY=e825ed6f7f8f44ffa0563cddaddce14d
+    fi
+
+    SQLITE_COMMAND="docker run -i \
+        --security-opt seccomp=unconfined \
+        --rm \
+        --net=host \
+        -v $MEDIA_DIR/config/data:/emby/config/data \
+        -e LANG=C.UTF-8 \
+        xiaoyaliu/glue:latest"
+    SQLITE_COMMAND_2="docker run -i \
+        --security-opt seccomp=unconfined \
+        --rm \
+        --net=host \
+        -v $MEDIA_DIR/config/data:/emby/config/data \
+        -v /tmp/emby_user.sql:/tmp/emby_user.sql \
+        -v /tmp/emby_library_mediaconfig.sql:/tmp/emby_library_mediaconfig.sql \
+        -e LANG=C.UTF-8 \
+        xiaoyaliu/glue:latest"
+    SQLITE_COMMAND_3="docker run -i \
+        --security-opt seccomp=unconfined \
+        --rm \
+        --net=host \
+        -v $MEDIA_DIR/temp/config/data:/emby/config/data \
+        -e LANG=C.UTF-8 \
+        xiaoyaliu/glue:latest"
+    EMBY_COMMAND="docker run -i \
+        --security-opt seccomp=unconfined \
+        --rm \
+        --net=host \
+        -v /tmp/emby.response:/tmp/emby.response \
+        -e LANG=C.UTF-8 \
+        xiaoyaliu/glue:latest"
+
+    if docker inspect xiaoyaliu/glue:latest > /dev/null 2>&1; then
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest | cut -f2 -d:)
+        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        if [ ! "$local_sha" == "$remote_sha" ]; then
+            docker rmi xiaoyaliu/glue:latest
+            if docker pull xiaoyaliu/glue:latest; then
+                INFO "镜像拉取成功！"
+            else
+                ERROR "镜像拉取失败！"
+                return 1
+            fi
+        fi
+    else
+        if docker pull xiaoyaliu/glue:latest; then
+            INFO "镜像拉取成功！"
+        else
+            ERROR "镜像拉取失败！"
+            return 1
+        fi
+    fi
+
+    INFO "保留用户 Policy 中..."
+    status=$(docker inspect -f '{{.State.Status}}' "${EMBY_NAME}")
+    if [ "$status" == "exited" ]; then
+        docker start "${EMBY_NAME}"
+        if ! wait_emby_start; then
+            return 1
+        fi
+    fi
+    curl -s "${EMBY_URL}/Users?api_key=${EMBY_APIKEY}" > /tmp/emby.response
+
+    INFO "Emby 关闭中..."
+    docker stop "${EMBY_NAME}"
+
+    sleep 4
+
+    INFO "导出数据库中..."
+    ${SQLITE_COMMAND} sqlite3 /emby/config/data/library.db ".dump UserDatas" > /tmp/emby_user.sql
+    ${SQLITE_COMMAND} sqlite3 /emby/config/data/library.db ".dump ItemExtradata" > /tmp/emby_library_mediaconfig.sql
+
+    INFO "备份数据中..."
+    files=(
+        "library.db"
+        "library.db-shm"
+        "library.db-wal"
+    )
+    for file in "${files[@]}"; do
+        src_file="$MEDIA_DIR/config/data/$file"
+        dest_file="$src_file.backup"
+        if [ -f "$src_file" ]; then
+            if [ -f "$dest_file" ]; then
+                rm -f "$dest_file"
+            fi
+            mv -f "$src_file" "$dest_file"
+        fi
+    done
+
+    INFO "清理旧数据..."
+    rm -f $MEDIA_DIR/temp/config.mp4
+
+    test_xiaoya_status
+
+    extra_parameters="--workdir=/media/temp"
+    _os_all=$(uname -a)
+    if echo -e "${_os_all}" | grep -Eqi "UGREEN"; then
+        INFO "绿联NAS使用 wget 下载"
+        pull_run_glue wget -c --show-progress "${xiaoya_addr}/d/元数据/config.mp4"
+    else
+        INFO "使用 aria2 下载"
+        pull_run_glue aria2c -o config.mp4 --continue=true -x6 --conditional-get=true --allow-overwrite=true "${xiaoya_addr}/d/元数据/config.mp4"
+    fi
+    if [ -f "${MEDIA_DIR}/temp/config.mp4.aria2" ]; then
+        ERROR "存在 ${MEDIA_DIR}/temp/config.mp4.aria2 文件，下载不完整！"
+        return 1
+    fi
+    # 在temp下面解压，最终新config文件路径为temp/config
+    if pull_run_glue 7z x -aoa -mmt=16 config.mp4; then
+        INFO "下载解压元数据完成"
+    else
+        ERROR "解压元数据失败"
+        return 1
+    fi
+
+    if ${SQLITE_COMMAND_3} sqlite3 /emby/config/data/library.db ".tables" | grep Chapters3 > /dev/null; then
+        cp -f $MEDIA_DIR/temp/config/data/library.db* $MEDIA_DIR/config/data/
+        ${SQLITE_COMMAND} sqlite3 /emby/config/data/library.db "DROP TABLE IF EXISTS UserDatas;"
+        ${SQLITE_COMMAND_2} sqlite3 /emby/config/data/library.db ".read /tmp/emby_user.sql"
+        ${SQLITE_COMMAND} sqlite3 /emby/config/data/library.db "DROP TABLE IF EXISTS ItemExtradata;"
+        ${SQLITE_COMMAND_2} sqlite3 /emby/config/data/library.db ".read /tmp/emby_library_mediaconfig.sql"
+        INFO "保存用户信息完成"
+        INFO "文件复制中..."
+        mkdir -p $MEDIA_DIR/config/cache
+        mkdir -p $MEDIA_DIR/config/metadata
+        cp -rf $MEDIA_DIR/temp/config/cache/* $MEDIA_DIR/config/cache/
+        cp -rf $MEDIA_DIR/temp/config/metadata/* $MEDIA_DIR/config/metadata/
+        rm -rf $MEDIA_DIR/temp/config/*
+        INFO "文件复制完成"
+        chmod -R 777 \
+            $MEDIA_DIR/config/data \
+            $MEDIA_DIR/config/cache \
+            $MEDIA_DIR/config/metadata
+        INFO "Emby 重启中..."
+        docker start ${EMBY_NAME}
+        sleep 30
+    else
+        ERROR "解压数据库不完整，跳过复制..."
+        INFO "恢复旧数据中..."
+        for file in "${files[@]}"; do
+            src_file="$MEDIA_DIR/config/data/$file"
+            dest_file="$src_file.backup"
+            if [ -f "$dest_file" ]; then
+                mv -f "$dest_file" "$src_file"
+            fi
+        done
+        return 1
+    fi
+
+    if ! wait_emby_start; then
+        return 1
+    fi
+
+    USER_COUNT=$(${EMBY_COMMAND} jq '.[].Name' /tmp/emby.response | wc -l)
+    for ((i = 0; i < USER_COUNT; i++)); do
+        if [[ "$USER_COUNT" -gt 50 ]]; then
+            WARN "用户超过 50 位，跳过更新用户 Policy！"
+            return 1
+        fi
+        id=$(${EMBY_COMMAND} jq -r ".[$i].Id" /tmp/emby.response)
+        name=$(${EMBY_COMMAND} jq -r ".[$i].Name" /tmp/emby.response)
+        policy=$(${EMBY_COMMAND} jq -r ".[$i].Policy | to_entries | from_entries | tojson" /tmp/emby.response)
+        USER_URL_2="${EMBY_URL}/Users/$id/Policy?api_key=${EMBY_APIKEY}"
+        status_code=$(curl -s -w "%{http_code}" -H "Content-Type: application/json" -X POST -d "$policy" "$USER_URL_2")
+        if [ "$status_code" == "204" ]; then
+            INFO "成功更新 $name 用户Policy"
+        else
+            ERROR "返回错误代码 $status_code"
+            return 1
+        fi
+    done
 
 }
 
@@ -337,14 +614,18 @@ function detection_all_pikpak_update() {
     if [ "${__COMPARE_METADATA_SIZE}" == "1" ]; then
         INFO "跳过 all.mp4 更新"
     else
-        update_media "all.mp4"
+        if ! update_media "all.mp4"; then
+            ERROR "all.mp4 元数据更新失败！"
+        fi
     fi
 
     compare_metadata_size "pikpak.mp4"
     if [ "${__COMPARE_METADATA_SIZE}" == "1" ]; then
         INFO "跳过 pikpak.mp4 更新"
     else
-        update_media "pikpak.mp4"
+        if ! update_media "pikpak.mp4"; then
+            ERROR "pikpak.mp4 元数据更新失败！"
+        fi
     fi
 
     INFO "全部媒体元数据更新完成！"
@@ -354,13 +635,13 @@ function detection_all_pikpak_update() {
 function detection_config_update() {
 
     if [ "${FORCE_UPDATE_CONFIG}" == "yes" ]; then
-        bash -c "$(curl http://docker.xiaoya.pro/sync_emby_config.sh.bak)" -s ${MEDIA_DIR} ${CONFIG_DIR} ${EMBY_NAME} ${RESILIO_NAME} ${EMBY_APIKEY}
+        sync_emby_config ${MEDIA_DIR} ${CONFIG_DIR} ${EMBY_NAME} ${RESILIO_NAME} ${EMBY_APIKEY}
     else
         compare_metadata_size "config.mp4"
         if [ "${__COMPARE_METADATA_SIZE}" == "1" ]; then
             INFO "跳过 config.mp4 更新"
         else
-            bash -c "$(curl http://docker.xiaoya.pro/sync_emby_config.sh.bak)" -s ${MEDIA_DIR} ${CONFIG_DIR} ${EMBY_NAME} ${RESILIO_NAME} ${EMBY_APIKEY}
+            sync_emby_config ${MEDIA_DIR} ${CONFIG_DIR} ${EMBY_NAME} ${RESILIO_NAME} ${EMBY_APIKEY}
         fi
     fi
 
@@ -370,14 +651,26 @@ function detection_xiaoya_version_update() {
 
     REMOTE_XIAOYA_VERSION=$(curl -skL https://docker.xiaoya.pro/version.txt | head -n 1 | sed "s/\r$//g")
 
+    if ! echo "${REMOTE_XIAOYA_VERSION}" | awk -F '[^0-9.]' '{print NF-1}' | grep -q '^0$'; then
+        REMOTE_XIAOYA_VERSION=error
+    fi
+
     docker cp ${XIAOYA_NAME}:/version.txt ${MEDIA_DIR}
-    LOCAL_XIAOYA_VERSION=$(cat ${MEDIA_DIR}/version.txt | head -n 1 | sed "s/\r$//g")
-    rm -f cat ${MEDIA_DIR}/version.txt
+    if [ -f "${MEDIA_DIR}/version.txt" ]; then
+        LOCAL_XIAOYA_VERSION=$(cat ${MEDIA_DIR}/version.txt | head -n 1 | sed "s/\r$//g")
+        rm -f cat ${MEDIA_DIR}/version.txt
+    else
+        LOCAL_XIAOYA_VERSION="error"
+    fi
 
     INFO "REMOTE_XIAOYA_VERSION: ${REMOTE_XIAOYA_VERSION}"
     INFO "LOCAL_XIAOYA_VERSION: ${LOCAL_XIAOYA_VERSION}"
 
-    if [ "${REMOTE_XIAOYA_VERSION}" == "${LOCAL_XIAOYA_VERSION}" ] || [ "${REMOTE_XIAOYA_VERSION}" == "" ]; then
+    if [ "${REMOTE_XIAOYA_VERSION}" == "${LOCAL_XIAOYA_VERSION}" ] ||
+        [ "${REMOTE_XIAOYA_VERSION}" == "" ] ||
+        [ "${LOCAL_XIAOYA_VERSION}" == "error" ] ||
+        [ "${REMOTE_XIAOYA_VERSION}" == "error" ] ||
+        [ -z "${REMOTE_XIAOYA_VERSION}" ]; then
         INFO "跳过小雅容器重启"
     else
         docker restart ${XIAOYA_NAME}
@@ -393,8 +686,10 @@ function detection_xiaoya_image_update() {
             remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/alist/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
             INFO "remote_sha: ${remote_sha}"
             INFO "local_sha: ${local_sha}"
-            if [ ! "${local_sha}" == "${remote_sha}" ]; then
-                container_update "${XIAOYA_NAME}"
+            if [ ! "${local_sha}" == "${remote_sha}" ] && [ -n "${remote_sha}" ] && [ -n "${local_sha}" ]; then
+                if ! container_update "${XIAOYA_NAME}"; then
+                    ERROR "小雅容器更新失败！"
+                fi
             else
                 INFO "跳过小雅容器更新"
             fi
@@ -405,8 +700,10 @@ function detection_xiaoya_image_update() {
             remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/alist/tags/hostmode" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
             INFO "remote_sha: ${remote_sha}"
             INFO "local_sha: ${local_sha}"
-            if [ ! "${local_sha}" == "${remote_sha}" ]; then
-                container_update "${XIAOYA_NAME}"
+            if [ ! "${local_sha}" == "${remote_sha}" ] && [ -n "${remote_sha}" ] && [ -n "${local_sha}" ]; then
+                if ! container_update "${XIAOYA_NAME}"; then
+                    ERROR "小雅容器更新失败！"
+                fi
             else
                 INFO "跳过小雅容器更新"
             fi
@@ -447,12 +744,17 @@ EOF
     fi
     # config.mp4
     if [ "${AUTO_UPDATE_CONFIG}" == "yes" ]; then
-        detection_config_update
+        if ! detection_config_update; then
+            ERROR "Emby config sync 运行失败！"
+        else
+            INFO "Emby config sync 运行成功！"
+        fi
     else
         INFO "Emby config sync 已关闭"
     fi
     # xiaoya image
     detection_xiaoya_image_update
+    sleep 20
     # xiaoya version
     detection_xiaoya_version_update
 
@@ -513,6 +815,10 @@ fi
 
 if [ -z ${EMBY_NAME} ]; then
     EMBY_NAME=emby
+fi
+
+if [ -z ${EMBY_APIKEY} ]; then
+    EMBY_APIKEY=e825ed6f7f8f44ffa0563cddaddce14d
 fi
 
 if [ -z ${RESILIO_NAME} ]; then

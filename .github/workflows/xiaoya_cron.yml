@@ -43,13 +43,14 @@ jobs:
 
       -
         name: Build Image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./cron
           file: cron/Dockerfile
           platforms: |
             linux/amd64
             linux/arm64/v8
+            linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
